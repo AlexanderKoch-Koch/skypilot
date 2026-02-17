@@ -219,6 +219,36 @@ class Vast(clouds.Cloud):
             default_value={},
             override_configs=resources.cluster_config_overrides,
         )
+        search_query_extra = skypilot_config.get_effective_region_config(
+            cloud='vast',
+            region=region.name,
+            keys=('search_query_extra',),
+            default_value=None,
+            override_configs=resources.cluster_config_overrides,
+        )
+        if search_query_extra is None:
+            search_query_extra = skypilot_config.get_effective_region_config(
+                cloud='vast',
+                region=region.name,
+                keys=('search_query_extra',),
+                default_value=None,
+                override_configs=None,
+            )
+        order_by_cpu_ghz = skypilot_config.get_effective_region_config(
+            cloud='vast',
+            region=region.name,
+            keys=('order_by_cpu_ghz',),
+            default_value=False,
+            override_configs=resources.cluster_config_overrides,
+        )
+        if not order_by_cpu_ghz:
+            order_by_cpu_ghz = skypilot_config.get_effective_region_config(
+                cloud='vast',
+                region=region.name,
+                keys=('order_by_cpu_ghz',),
+                default_value=False,
+                override_configs=None,
+            )
 
         return {
             'instance_type': resources.instance_type,
@@ -227,6 +257,8 @@ class Vast(clouds.Cloud):
             'image_id': image_id,
             'secure_only': secure_only,
             'create_instance_kwargs': create_instance_kwargs or {},
+            'search_query_extra': search_query_extra,
+            'order_by_cpu_ghz': order_by_cpu_ghz,
         }
 
     def _get_feasible_launchable_resources(

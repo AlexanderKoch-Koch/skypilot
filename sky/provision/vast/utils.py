@@ -9,6 +9,8 @@ from pathlib import Path
 import shlex
 from typing import Any, Dict, List, Optional
 
+import requests
+
 from sky import sky_logging
 from sky.adaptors import vast
 
@@ -18,6 +20,16 @@ logger = sky_logging.init_logger(__name__)
 def list_instances() -> Dict[str, Dict[str, Any]]:
     """Lists instances associated with API key."""
     instances = vast.vast().show_instances()
+
+    # The Vast SDK wraps every call in `try: ... except: pass` and returns ''
+    # on ANY failure (network error, timeout, API error).  Detect this and
+    # raise so SkyPilot treats it as a transient error (UNKNOWN status, no
+    # deletion) rather than "zero instances" (which triggers cluster deletion).
+    if not isinstance(instances, list):
+        raise RuntimeError(
+            'Vast API returned invalid response '
+            f'(type={type(instances).__name__!r}, value={instances!r}). '
+            'The API may be unreachable.')
 
     instance_dict: Dict[str, Dict[str, Any]] = {}
     for instance in instances:
@@ -46,7 +58,9 @@ def launch(name: str,
            private_docker_registry: Optional[bool] = None,
            login: Optional[str] = None,
            create_instance_kwargs: Optional[Dict[str, Any]] = None,
-           ssh_public_key: Optional[str] = None) -> str:
+           ssh_public_key: Optional[str] = None,
+           search_query_extra: Optional[str] = None,
+           order_by_cpu_ghz: bool = False) -> str:
     """Launches an instance with the given parameters.
 
     Converts the instance_type to the Vast GPU name, finds the specs for the
@@ -107,12 +121,24 @@ def launch(name: str,
          catalog/vast_catalog.py for the current construction
          of the type.
     """
-    cpu_ram = float(instance_type.split('-')[-1]) / 1024
+    # SkyPilot uses docker:<tag> for image_id; Vast expects the raw image tag
+    if image_name.startswith('docker:'):
+        image_name = image_name[7:]
+    # Use 90% of the catalog RAM as the floor.  Vast reports usable RAM
+    # which can be slightly below the nominal value (e.g. 62 GB for a 64 GB
+    # machine), so a strict equality would exclude valid offers.
+    cpu_ram = float(instance_type.split('-')[-1]) / 1024 * 0.9
     gpu_name = instance_type.split('-')[1].replace('_', ' ')
     num_gpus = int(instance_type.split('-')[0].replace('x', ''))
 
+    # When filtering/sorting by CPU, use chunked=false so cpu_ghz filter and
+    # order apply to real per-machine offers (matches Vast GUI behavior).
+    use_cpu_preference = (
+        (search_query_extra and search_query_extra.strip()) or order_by_cpu_ghz)
+    use_chunked = not use_cpu_preference
+
     query = [
-        'chunked=true',
+        'chunked=true' if use_chunked else 'chunked=false',
         'georegion=true',
         f'geolocation="{region[-2:]}"',
         f'disk_space>={disk_size}',
@@ -123,16 +149,57 @@ def launch(name: str,
     if secure_only:
         query.append('datacenter=true')
         query.append('hosting_type>=1')
+    if search_query_extra and search_query_extra.strip():
+        query.append(search_query_extra.strip())
     query_str = ' '.join(query)
 
-    instance_list = vast.vast().search_offers(query=query_str)
+    order = 'cpu_ghz-' if order_by_cpu_ghz else None
+    limit = 100 if order_by_cpu_ghz else None
+    instance_list = vast.vast().search_offers(
+        query=query_str, limit=limit, order=order)
 
-    if isinstance(instance_list, int) or len(instance_list) == 0:
+    # If 0 results with region (e.g. no US offers with cpu_ghz>=4.5), retry
+    # without geolocation so we get worldwide offers and still satisfy CPU filter.
+    if use_cpu_preference and (
+            isinstance(instance_list, int) or len(instance_list) == 0):
+        query_no_region = [
+            'chunked=false',
+            f'disk_space>={disk_size}',
+            f'num_gpus={num_gpus}',
+            f'gpu_name="{gpu_name}"',
+            f'cpu_ram>="{cpu_ram}"',
+        ]
+        if secure_only:
+            query_no_region.append('datacenter=true')
+            query_no_region.append('hosting_type>=1')
+        if search_query_extra and search_query_extra.strip():
+            query_no_region.append(search_query_extra.strip())
+        fallback_str = ' '.join(query_no_region)
+        instance_list = vast.vast().search_offers(
+            query=fallback_str, limit=limit, order=order)
+        if isinstance(instance_list, int) or len(instance_list) == 0:
+            raise RuntimeError('Failed to create instances, could not find an '
+                               'offer that satisfies the requirements '
+                               f'"{query_str}". No offers either in region or '
+                               'worldwide.')
+        logger.info('No offers in region with CPU filter; using worldwide '
+                    'offer (best CPU first).')
+        query_str = fallback_str
+    elif isinstance(instance_list, int) or len(instance_list) == 0:
         raise RuntimeError('Failed to create instances, could not find an '
                            'offer that satisfies the requirements '
                            f'"{query_str}".')
 
+    if order_by_cpu_ghz:
+        instance_list = sorted(
+            instance_list,
+            key=lambda o: float(o.get('cpu_ghz') or 0),
+            reverse=True)
     instance_touse = instance_list[0]
+    if use_cpu_preference:
+        logger.info('Vast selected offer: %.2f GHz %s',
+                    float(instance_touse.get('cpu_ghz') or 0),
+                    (instance_touse.get('cpu_name') or '')[:60])
 
     # Start with user-provided kwargs as the base
     launch_params: Dict[str, Any] = dict(create_instance_kwargs or {})
@@ -200,6 +267,15 @@ def launch(name: str,
     skypilot_onstart = [
         'touch ~/.no_auto_tmux',
         f'echo "{vast.vast().api_key_access}" > ~/.vast_api_key',
+        # Ensure libcuda.so symlink exists.  Vast containers often only have
+        # libcuda.so.1 from the nvidia-container-toolkit mount; the unversioned
+        # libcuda.so symlink is missing.  PhysX (Isaac Sim) calls
+        # dlopen("libcuda.so") which fails without it, causing the GPU solver
+        # pipeline to fall back to software.
+        ('test -e /usr/lib/x86_64-linux-gnu/libcuda.so.1 '
+         '&& ! test -e /usr/lib/x86_64-linux-gnu/libcuda.so '
+         '&& ln -s libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so '
+         '&& ldconfig || true'),
     ]
 
     # Inject SSH public key into authorized_keys if provided
@@ -222,9 +298,15 @@ def launch(name: str,
 
     # Handle env - merge port mappings and user env
     # Always include __SOURCE=skypilot for instance tracking
+    # NVIDIA_DRIVER_CAPABILITIES=all is required at container creation time
+    # so that the nvidia-container-toolkit exposes graphics/compute/video
+    # capabilities (needed by PhysX GPU pipeline, Vulkan, etc.).
     user_env = launch_params.pop('env', None)
     port_map = ' '.join([f'-p {p}:{p}' for p in ports]) if ports else ''
-    env_parts = ['-e __SOURCE=skypilot']
+    env_parts = [
+        '-e __SOURCE=skypilot',
+        '-e NVIDIA_DRIVER_CAPABILITIES=all',
+    ]
     if port_map:
         env_parts.append(port_map)
     if user_env:
@@ -232,6 +314,49 @@ def launch(name: str,
     launch_params['env'] = ' '.join(env_parts).strip()
 
     new_instance_contract = vast.vast().create_instance(**launch_params)
+    if not isinstance(new_instance_contract,
+                      dict) or 'new_contract' not in new_instance_contract:
+        # SDK can swallow HTTP errors and return ''; do one PUT to surface it
+        logger.warning('[Vast] create_instance returned invalid value, doing '
+                       'direct PUT to surface API error')
+        api_key = vast.vast().api_key_access
+        url = (f'https://console.vast.ai/api/v0/asks/{launch_params["id"]}/'
+               f'?api_key={api_key}')
+        r = requests.put(
+            url,
+            headers={
+                'Authorization': f'Bearer {api_key}',
+                'Content-Type': 'application/json',
+            },
+            json={
+                'client_id': 'me',
+                'image': launch_params.get('image'),
+                'disk': launch_params.get('disk'),
+                'label': launch_params.get('label'),
+                'onstart': launch_params.get('onstart_cmd', ''),
+                'env': {},  # API expects dict; SDK uses string for docker -e args
+                'price': launch_params.get('bid_price'),
+                'runtype': 'ssh_direc ssh_proxy',
+            },
+            timeout=60,
+        )
+        if r.status_code != 200:
+            try:
+                err = r.json()
+                msg = err.get('msg', r.text)
+                if err.get('error') == 'insufficient_credit':
+                    raise RuntimeError(
+                        f'Vast: insufficient account credit. Add credit at '
+                        f'https://cloud.vast.ai (billing). API msg: {msg}')
+            except (ValueError, KeyError, TypeError):
+                pass
+            raise RuntimeError(f'Vast API error: {r.status_code} {r.text}')
+        try:
+            new_instance_contract = r.json()
+        except Exception:
+            raise RuntimeError(f'Vast API error: {r.status_code} {r.text}')
+        if not isinstance(new_instance_contract, dict) or 'new_contract' not in new_instance_contract:
+            raise RuntimeError(f'Vast API error: {r.status_code} {r.text}')
 
     new_instance = vast.vast().show_instance(
         id=new_instance_contract['new_contract'])

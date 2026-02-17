@@ -895,6 +895,11 @@ def get_task_schema():
             'resources': {
                 'type': 'object',
             },
+            # Cloud-specific provider options (e.g. provider.vast); used when
+            # generating cluster config for the selected cloud.
+            'provider': {
+                'type': 'object',
+            },
             # storage config is validated separately using STORAGE_SCHEMA
             'file_mounts': {
                 'type': 'object',
@@ -1554,6 +1559,12 @@ def get_config_schema():
                 },
                 'create_instance_kwargs': {
                     'type': 'object',
+                },
+                'search_query_extra': {
+                    'type': 'string',
+                },
+                'order_by_cpu_ghz': {
+                    'type': 'boolean',
                 },
             }
         },
