@@ -14,6 +14,10 @@ provider:
   {%- if create_instance_kwargs %}
   create_instance_kwargs: {{create_instance_kwargs | tojson}}
   {%- endif %}
+  {%- if search_query_extra %}
+  search_query_extra: "{{ search_query_extra }}"
+  {%- endif %}
+  order_by_cpu_ghz: {{ order_by_cpu_ghz | default(false) | lower }}
 
 auth:
   ssh_user: root

@@ -215,6 +215,9 @@ _RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS = [
     # we need to take this field from the new yaml.
     ('provider', 'tpu_node'),
     ('provider', 'security_group', 'GroupName'),
+    # Vast: use new yaml's CPU preference so re-launch picks fast CPU
+    ('provider', 'search_query_extra'),
+    ('provider', 'order_by_cpu_ghz'),
     ('available_node_types', 'ray.head.default', 'node_config',
      'IamInstanceProfile'),
     ('available_node_types', 'ray.head.default', 'node_config', 'UserData'),
@@ -223,6 +226,12 @@ _RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS = [
     ('available_node_types', 'ray_head_default', 'node_config', 'pvc_spec'),
     ('available_node_types', 'ray_head_default', 'node_config',
      'deployment_spec'),
+]
+# When new yaml doesn't have these keys (e.g. sky start without task), keep
+# value from old cluster yaml so CPU preference is preserved across restarts.
+_RAY_YAML_KEYS_RESTORE_EXCEPTIONS_FALLBACK_OLD = [
+    ('provider', 'search_query_extra'),
+    ('provider', 'order_by_cpu_ghz'),
 ]
 # These keys are expected to change when provisioning on an existing cluster,
 # but they don't actually represent a change that requires re-provisioning the
@@ -503,7 +512,9 @@ class FileMountHelper(object):
 
 def _replace_yaml_dicts(
         new_yaml: str, old_yaml: str, restore_key_names: Set[str],
-        restore_key_names_exceptions: Sequence[Tuple[str, ...]]) -> str:
+        restore_key_names_exceptions: Sequence[Tuple[str, ...]],
+        fallback_old_key_names: Optional[Sequence[Tuple[str, ...]]] = None
+) -> str:
     """Replaces 'new' with 'old' for all keys in restore_key_names.
 
     The replacement will be applied recursively and only for the blocks
@@ -513,7 +524,13 @@ def _replace_yaml_dicts(
     The restore_key_names_exceptions is a list of key names that should not
     be restored, i.e. those keys will be reset to the value in 'new' YAML
     tree after the replacement.
+
+    If fallback_old_key_names is set, for those keys use new value when
+    present, otherwise use old value (so e.g. sky start without task
+    preserves provider options from the last launch).
     """
+    if fallback_old_key_names is None:
+        fallback_old_key_names = []
 
     def _restore_block(new_block: Dict[str, Any], old_block: Dict[str, Any]):
         for key, value in new_block.items():
@@ -529,7 +546,7 @@ def _replace_yaml_dicts(
     new_config = yaml_utils.safe_load(new_yaml)
     old_config = yaml_utils.safe_load(old_yaml)
     excluded_results = {}
-    # Find all key values excluded from restore
+    # Find all key values excluded from restore (from new config)
     for exclude_restore_key_name_list in restore_key_names_exceptions:
         excluded_result = new_config
         found_excluded_key = True
@@ -542,15 +559,32 @@ def _replace_yaml_dicts(
         if found_excluded_key:
             excluded_results[exclude_restore_key_name_list] = excluded_result
 
+    # For fallback keys, save value from old config (used when new has no value)
+    fallback_old_results = {}
+    for key_list in fallback_old_key_names:
+        curr = old_config
+        found = True
+        for key in key_list:
+            if not isinstance(curr, dict) or key not in curr:
+                found = False
+                break
+            curr = curr[key]
+        if found:
+            fallback_old_results[key_list] = curr
+
     # Restore from old config
     _restore_block(new_config, old_config)
 
-    # Revert the changes for the excluded key values
-    for exclude_restore_key_name, value in excluded_results.items():
-        curr = new_config
-        for key in exclude_restore_key_name[:-1]:
-            curr = curr[key]
-        curr[exclude_restore_key_name[-1]] = value
+    # Revert the changes for the excluded key values (prefer new, else old)
+    for exclude_restore_key_name in restore_key_names_exceptions:
+        value = excluded_results.get(exclude_restore_key_name)
+        if value is None and exclude_restore_key_name in fallback_old_results:
+            value = fallback_old_results[exclude_restore_key_name]
+        if value is not None:
+            curr = new_config
+            for key in exclude_restore_key_name[:-1]:
+                curr = curr[key]
+            curr[exclude_restore_key_name[-1]] = value
     return yaml_utils.dump_yaml_str(new_config)
 
 
@@ -1117,7 +1151,8 @@ def write_cluster_config(
         restored_yaml_content = _replace_yaml_dicts(
             new_yaml_content, old_yaml_content,
             _RAY_YAML_KEYS_TO_RESTORE_FOR_BACK_COMPATIBILITY,
-            _RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS)
+            _RAY_YAML_KEYS_TO_RESTORE_EXCEPTIONS,
+            fallback_old_key_names=_RAY_YAML_KEYS_RESTORE_EXCEPTIONS_FALLBACK_OLD)
         with open(tmp_yaml_path, 'w', encoding='utf-8') as f:
             f.write(restored_yaml_content)
 

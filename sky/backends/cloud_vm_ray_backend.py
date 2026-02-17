@@ -1671,6 +1671,29 @@ class RetryingVmProvisioner(object):
         """
         cluster_name = to_provision_config.cluster_name
         to_provision = to_provision_config.resources
+        # Merge task's provider (e.g. provider.vast) into to_provision so
+        # write_cluster_config and the provisioner see search_query_extra,
+        # order_by_cpu_ghz, etc.
+        if task is not None:
+            task_res = (list(task.resources)[0] if isinstance(task.resources,
+                                                              set) else
+                        task.resources)
+            task_overrides = task_res.cluster_config_overrides or {}
+            if task_overrides:
+                to_provision = to_provision.copy(_cluster_config_overrides={
+                    **(to_provision.cluster_config_overrides or {}),
+                    **task_overrides,
+                })
+        # Debug: log Vast provider overrides so provision config has expected keys
+        if (to_provision.cloud is not None and
+                isinstance(to_provision.cloud, clouds.Vast)):
+            vast_overrides = (to_provision.cluster_config_overrides or {}).get(
+                'vast') or {}
+            logger.debug(
+                'Vast provision overrides: task=%s vast_keys=%s',
+                task is not None,
+                {k: vast_overrides.get(k) for k in ('search_query_extra',
+                                                    'order_by_cpu_ghz')})
         num_nodes = to_provision_config.num_nodes
         prev_cluster_status = to_provision_config.prev_cluster_status
         prev_handle = to_provision_config.prev_handle

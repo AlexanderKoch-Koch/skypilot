@@ -730,6 +730,18 @@ class Task:
         # Store the final config override for use in resource setup
         cluster_config_override = config_override
 
+        # Merge provider (e.g. provider.vast) into cluster_config_override so
+        # get_effective_region_config() sees it when the cloud builds provision config.
+        provider = config.pop('provider', None)
+        if provider:
+            if cluster_config_override is None:
+                cluster_config_override = {}
+            for cloud, opts in provider.items():
+                if not isinstance(opts, dict):
+                    continue
+                existing = cluster_config_override.get(cloud) or {}
+                cluster_config_override[cloud] = {**existing, **opts}
+
         # Parse resources field.
         resources_config = config.pop('resources', {})
         if cluster_config_override is not None:

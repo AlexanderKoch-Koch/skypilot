@@ -4,6 +4,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from sky import sky_logging
+from sky import skypilot_config
 from sky.provision import common
 from sky.provision import docker_utils
 from sky.provision.vast import utils
@@ -123,6 +124,26 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                                           created_instance_ids=[])
 
         secure_only = config.provider_config.get('secure_only', False)
+        search_query_extra = config.provider_config.get('search_query_extra')
+        order_by_cpu_ghz = config.provider_config.get('order_by_cpu_ghz', False)
+        # Fallback to ~/.sky/config.yaml when cluster YAML lacks these (e.g.
+        # server path or restore step dropped them)
+        if search_query_extra is None:
+            search_query_extra = skypilot_config.get_effective_region_config(
+                cloud='vast',
+                region=region,
+                keys=('search_query_extra',),
+                default_value=None,
+                override_configs=None,
+            )
+        if not order_by_cpu_ghz:
+            order_by_cpu_ghz = skypilot_config.get_effective_region_config(
+                cloud='vast',
+                region=region,
+                keys=('order_by_cpu_ghz',),
+                default_value=False,
+                override_configs=None,
+            )
         for _ in range(to_start_count):
             node_type = 'head' if head_instance_id is None else 'worker'
             try:
@@ -139,6 +160,8 @@ def run_instances(region: str, cluster_name: str, cluster_name_on_cloud: str,
                     login=login_args,
                     create_instance_kwargs=create_instance_kwargs,
                     ssh_public_key=ssh_public_key,
+                    search_query_extra=search_query_extra,
+                    order_by_cpu_ghz=order_by_cpu_ghz,
                 )
             except Exception as e:  # pylint: disable=broad-except
                 logger.warning(f'run_instances error: {e}')
